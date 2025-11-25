@@ -10,12 +10,11 @@ import json
 import sys
 import csv
 import time
-import pandas as pd
 from pathlib import Path
 from dotenv import load_dotenv
 import google.generativeai as genai
 from google.generativeai.types import Tool
-from read_excel_to_json import read_excel_to_json
+import pandas as pd
 
 # Load environment variables
 load_dotenv()
@@ -312,24 +311,89 @@ def append_to_csv(original_record, enriched_data):
         writer.writerow(row_data)
 
 
+def read_single_excel_row(excel_file_path, row_index, sheet_name=None):
+    """
+    Read a single row from Excel file (memory efficient for large files)
+    
+    Args:
+        excel_file_path: Path to Excel file
+        row_index: Zero-based index of the data row (0 = first data row, after header)
+        sheet_name: Sheet name (None = first sheet)
+    
+    Returns:
+        dict: Row data as dictionary, or None if row doesn't exist
+    """
+    try:
+        # Excel structure:
+        # Row 0 = Header
+        # Row 1 = First data row (row_index 0)
+        # Row 2 = Second data row (row_index 1)
+        # 
+        # To read row_index N, we need to:
+        # - Use header=0 to tell pandas row 0 is header
+        # - Skip data rows 1 to N (Excel rows 1 to N)
+        # - Read 1 row (Excel row N+1)
+        
+        # Build read_excel parameters
+        read_params = {
+            'header': 0,  # Row 0 is header
+            'nrows': 1    # Read only 1 row
+        }
+        
+        if row_index > 0:
+            # Skip previous data rows (Excel rows 1 to row_index)
+            read_params['skiprows'] = list(range(1, row_index + 1))
+        
+        if sheet_name:
+            read_params['sheet_name'] = sheet_name
+        else:
+            read_params['sheet_name'] = 0  # First sheet
+        
+        df = pd.read_excel(excel_file_path, **read_params)
+        
+        if df.empty:
+            return None
+        
+        # Convert to dictionary (single record)
+        record = df.iloc[0].to_dict()
+        
+        # Convert NaN to None for JSON compatibility
+        record = {k: (None if pd.isna(v) else v) for k, v in record.items()}
+        
+        return record
+    
+    except Exception as e:
+        # Row doesn't exist or error reading
+        return None
+
+
 def get_next_unprocessed_record(excel_file_path, sheet_name=None):
-    """Get the next unprocessed record from Excel"""
+    """
+    Get the next unprocessed record from Excel (reads one row at a time)
+    Memory efficient for large files with millions of records
+    """
     processed_indices = load_processed_records()
     
-    # Read all records
-    json_data = read_excel_to_json(excel_file_path, sheet_name)
+    # Start from index 0 and check each row one by one
+    # Stop at a reasonable limit to avoid infinite loop (e.g., 10 million rows)
+    max_rows_to_check = 10_000_000
     
-    if sheet_name:
-        records = json_data.get('data', [])
-    else:
-        first_sheet = list(json_data.keys())[0]
-        records = json_data[first_sheet]
+    for index in range(max_rows_to_check):
+        # Skip if already processed
+        if index in processed_indices:
+            continue
+        
+        # Read this specific row
+        record = read_single_excel_row(excel_file_path, index, sheet_name)
+        
+        if record is None:
+            # No more rows in Excel
+            return None, None
+        
+        # Found unprocessed record
+        return index, record
     
-    # Find first unprocessed record
-    for index, record in enumerate(records):
-        if index not in processed_indices:
-            return index, record
-    
+    # Reached max check limit
     return None, None
 
 
@@ -411,16 +475,22 @@ def process_one_record(excel_file_path, sheet_name=None):
 
 
 def get_total_records(excel_file_path, sheet_name=None):
-    """Get total number of records in Excel file"""
+    """
+    Get total number of records in Excel file (efficient - doesn't load all data)
+    """
     try:
-        json_data = read_excel_to_json(excel_file_path, sheet_name)
+        # Read Excel file to get row count (pandas loads into memory but we only need count)
+        # For very large files, this still loads data, but it's the simplest approach
+        # Alternative would be to use openpyxl directly to count rows without loading data
         if sheet_name:
-            records = json_data.get('data', [])
+            df = pd.read_excel(excel_file_path, sheet_name=sheet_name)
         else:
-            first_sheet = list(json_data.keys())[0]
-            records = json_data[first_sheet]
-        return len(records)
-    except:
+            # Read first sheet
+            df = pd.read_excel(excel_file_path, sheet_name=0)
+        
+        return len(df)
+    except Exception as e:
+        print(f"⚠️  Warning: Could not count total records: {e}")
         return 0
 
 
