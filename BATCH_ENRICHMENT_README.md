@@ -5,11 +5,13 @@ This script processes Excel records one by one, enriches them with Gemini Ground
 ## Features
 
 - ✅ Processes one record at a time
+- ✅ **Multiple API Keys Support** - Automatic fallback when one key fails
 - ✅ Tracks processed records (no duplicates)
 - ✅ Saves to CSV file (creates if doesn't exist)
 - ✅ Includes all original fields + enriched fields
 - ✅ Can resume from where it left off
 - ✅ Uses Google Grounding to find phone, email, and business type
+- ✅ Continuous processing - automatically switches API keys on quota errors
 
 ## Usage
 
@@ -110,9 +112,24 @@ If you see "✅ All records have been processed!", you're done!
 - If you delete it, it will be recreated with headers
 - Already processed records will be skipped (won't duplicate)
 
+## Multiple API Keys Setup
+
+The script supports multiple API keys with automatic fallback. See [MULTIPLE_API_KEYS.md](MULTIPLE_API_KEYS.md) for detailed instructions.
+
+**Quick Setup:**
+1. Add multiple keys to `.env` file:
+   ```
+   GOOGLE_API_KEYS=key1,key2,key3,key4
+   ```
+2. The script will automatically:
+   - Use the first working key
+   - Switch to next key if quota exceeded
+   - Continue processing without interruption
+
 ## Configuration
 
 You can modify these constants in the script:
 - `TRACKING_FILE = "processed_records.json"` - File to track processed records
 - `OUTPUT_CSV = "enriched_data.csv"` - Output CSV file name
+- `API_KEYS_FILE = "api_keys_status.json"` - File to track API key status
 

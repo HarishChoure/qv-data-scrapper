@@ -9,6 +9,7 @@ import os
 import json
 import sys
 import csv
+import time
 import pandas as pd
 from pathlib import Path
 from dotenv import load_dotenv
@@ -22,6 +23,7 @@ load_dotenv()
 # Configuration
 TRACKING_FILE = "processed_records.json"
 OUTPUT_CSV = "enriched_data.csv"
+API_KEYS_FILE = "api_keys_status.json"  # Track which API keys are working
 
 
 def load_processed_records():
@@ -45,15 +47,105 @@ def save_processed_record(index):
         json.dump({'processed_indices': list(processed)}, f, indent=2)
 
 
-def setup_gemini_client():
-    """Setup Gemini API client with Google Grounding enabled"""
-    api_key = os.getenv('GOOGLE_API_KEY')
+def load_api_keys():
+    """Load API keys from environment variables"""
+    # Try GOOGLE_API_KEY first (single key)
+    single_key = os.getenv('GOOGLE_API_KEY')
     
-    if not api_key or api_key == 'your_api_key_here':
+    # Try GOOGLE_API_KEYS (comma-separated list)
+    keys_str = os.getenv('GOOGLE_API_KEYS', '')
+    
+    api_keys = []
+    
+    # Add single key if valid
+    if single_key and single_key != 'your_api_key_here':
+        api_keys.append(single_key)
+    
+    # Add multiple keys from GOOGLE_API_KEYS
+    if keys_str:
+        keys_list = [k.strip() for k in keys_str.split(',') if k.strip() and k.strip() != 'your_api_key_here']
+        api_keys.extend(keys_list)
+    
+    # Remove duplicates while preserving order
+    seen = set()
+    unique_keys = []
+    for key in api_keys:
+        if key not in seen:
+            seen.add(key)
+            unique_keys.append(key)
+    
+    if not unique_keys:
         raise ValueError(
-            "GOOGLE_API_KEY not found in .env file. "
-            "Please add your API key to the .env file."
+            "No valid API keys found. Please set GOOGLE_API_KEY or GOOGLE_API_KEYS in .env file.\n"
+            "For multiple keys, use: GOOGLE_API_KEYS=key1,key2,key3"
         )
+    
+    return unique_keys
+
+
+def load_api_keys_status():
+    """Load API keys status (which ones are working/failed)"""
+    if Path(API_KEYS_FILE).exists():
+        try:
+            with open(API_KEYS_FILE, 'r') as f:
+                return json.load(f)
+        except:
+            return {"failed_keys": [], "working_keys": []}
+    return {"failed_keys": [], "working_keys": []}
+
+
+def save_api_key_status(key, is_working=True):
+    """Save API key status"""
+    status = load_api_keys_status()
+    
+    if is_working:
+        if key not in status["working_keys"]:
+            status["working_keys"].append(key)
+        if key in status["failed_keys"]:
+            status["failed_keys"].remove(key)
+    else:
+        if key not in status["failed_keys"]:
+            status["failed_keys"].append(key)
+        if key in status["working_keys"]:
+            status["working_keys"].remove(key)
+    
+    with open(API_KEYS_FILE, 'w') as f:
+        json.dump(status, f, indent=2)
+
+
+def get_next_working_api_key():
+    """Get the next working API key, skipping failed ones"""
+    all_keys = load_api_keys()
+    status = load_api_keys_status()
+    failed_keys = set(status.get("failed_keys", []))
+    
+    # Try working keys first
+    working_keys = [k for k in status.get("working_keys", []) if k in all_keys and k not in failed_keys]
+    for key in working_keys:
+        if key in all_keys:
+            return key
+    
+    # Try keys that haven't been marked as failed
+    untested_keys = [k for k in all_keys if k not in failed_keys]
+    if untested_keys:
+        return untested_keys[0]
+    
+    # If all keys are failed, reset and try again
+    print("⚠️  All API keys have failed. Resetting and trying again...")
+    status["failed_keys"] = []
+    with open(API_KEYS_FILE, 'w') as f:
+        json.dump(status, f, indent=2)
+    
+    return all_keys[0] if all_keys else None
+
+
+def setup_gemini_client(api_key=None):
+    """Setup Gemini API client with Google Grounding enabled"""
+    if api_key is None:
+        api_key = get_next_working_api_key()
+    
+    if not api_key:
+        raise ValueError("No API key available")
     
     genai.configure(api_key=api_key)
     
@@ -63,15 +155,14 @@ def setup_gemini_client():
             model_name='gemini-2.5-flash',
             tools=[google_grounding_tool]
         )
-        print("✅ Google Grounding enabled")
+        return model, api_key
     except Exception as e:
         print(f"⚠️  Could not enable grounding: {e}")
         model = genai.GenerativeModel(model_name='gemini-2.5-flash')
-    
-    return model
+        return model, api_key
 
 
-def enrich_record_with_gemini(model, record):
+def enrich_record_with_gemini(model, record, api_key=None):
     """Enrich a single record with Gemini"""
     enterprise_name = record.get('EnterpriseName', '')
     communication_address = record.get('CommunicationAddress', '')
@@ -157,6 +248,19 @@ Do not include any text before or after the JSON. Only return the JSON object.""
         return result
     
     except Exception as e:
+        error_str = str(e).lower()
+        
+        # Check if it's an API key/quota error
+        is_quota_error = any(keyword in error_str for keyword in [
+            'quota', '429', 'rate limit', 'billing', 'api key', 'invalid',
+            'permission denied', 'authentication', 'unauthorized'
+        ])
+        
+        if is_quota_error and api_key:
+            print(f"⚠️  API key quota/error detected. Marking key as failed.")
+            save_api_key_status(api_key, is_working=False)
+            raise Exception(f"API_KEY_ERROR: {str(e)}")  # Re-raise to trigger key rotation
+        
         print(f"⚠️  Error during enrichment: {str(e)}")
         return {
             "phone_number": None,
@@ -247,12 +351,46 @@ def process_one_record(excel_file_path, sheet_name=None):
     print(f"   District: {record.get('District', 'N/A')}")
     print(f"   State: {record.get('State', 'N/A')}")
     
-    # Setup Gemini
-    model = setup_gemini_client()
+    # Setup Gemini with automatic key rotation
+    max_retries = 5  # Maximum number of API keys to try
+    retry_count = 0
+    enriched_data = None
     
-    # Enrich record
-    print("\n🔍 Enriching with Gemini Grounding...")
-    enriched_data = enrich_record_with_gemini(model, record)
+    while retry_count < max_retries:
+        try:
+            # Get next working API key and setup model
+            api_key = get_next_working_api_key()
+            if not api_key:
+                raise ValueError("No API keys available")
+            
+            print(f"\n🔑 Using API key #{retry_count + 1} (ending in ...{api_key[-4:]})")
+            model, current_api_key = setup_gemini_client(api_key)
+            print("✅ Google Grounding enabled")
+            
+            # Enrich record
+            print("\n🔍 Enriching with Gemini Grounding...")
+            enriched_data = enrich_record_with_gemini(model, record, current_api_key)
+            
+            # If successful, mark key as working
+            save_api_key_status(current_api_key, is_working=True)
+            break  # Success, exit retry loop
+            
+        except Exception as e:
+            error_str = str(e)
+            if "API_KEY_ERROR" in error_str:
+                retry_count += 1
+                if retry_count < max_retries:
+                    print(f"⚠️  Switching to next API key... (Attempt {retry_count + 1}/{max_retries})")
+                    continue
+                else:
+                    print(f"❌ All API keys exhausted. Please check your API keys or wait for quota reset.")
+                    raise Exception("All API keys failed. Please check your .env file or wait for quota reset.")
+            else:
+                # Non-API-key error, don't retry
+                raise
+    
+    if enriched_data is None:
+        raise Exception("Failed to enrich record after all retries")
     
     # Display results
     print(f"\n✅ Enrichment Complete:")
@@ -272,8 +410,23 @@ def process_one_record(excel_file_path, sheet_name=None):
     return True
 
 
+def get_total_records(excel_file_path, sheet_name=None):
+    """Get total number of records in Excel file"""
+    try:
+        json_data = read_excel_to_json(excel_file_path, sheet_name)
+        if sheet_name:
+            records = json_data.get('data', [])
+        else:
+            first_sheet = list(json_data.keys())[0]
+            records = json_data[first_sheet]
+        return len(records)
+    except:
+        return 0
+
+
 def main():
-    """Main function"""
+    """Main function - processes all records continuously"""
+    
     excel_file = "New Microsoft Excel Worksheet.xlsx"
     
     if len(sys.argv) > 1:
@@ -283,19 +436,106 @@ def main():
     if len(sys.argv) > 2:
         sheet_name = sys.argv[2]
     
+    # Optional: delay between records (in seconds) to avoid rate limits
+    delay_between_records = 2  # 2 seconds delay
+    
+    if len(sys.argv) > 3:
+        try:
+            delay_between_records = float(sys.argv[3])
+        except:
+            pass
+    
     try:
-        # Process one record
-        has_more = process_one_record(excel_file, sheet_name)
+        # Get total records
+        total_records = get_total_records(excel_file, sheet_name)
+        processed_count = len(load_processed_records())
         
-        if has_more:
-            print(f"\n📊 Progress: Check {TRACKING_FILE} for processed records")
-            print(f"📁 Output: {OUTPUT_CSV}")
-            print(f"\n💡 Run again to process the next record")
-        else:
-            print(f"\n🎉 All done! Check {OUTPUT_CSV} for all enriched data")
+        print("="*60)
+        print("🚀 Continuous Batch Enrichment Started")
+        print("="*60)
+        print(f"📁 Excel File: {excel_file}")
+        print(f"📊 Total Records: {total_records}")
+        print(f"✅ Already Processed: {processed_count}")
+        print(f"⏳ Remaining: {total_records - processed_count}")
+        print(f"⏱️  Delay between records: {delay_between_records} seconds")
+        print("="*60)
+        print("\n💡 Press Ctrl+C to stop (progress will be saved)\n")
+        
+        record_count = 0
+        consecutive_errors = 0
+        max_consecutive_errors = 3
+        
+        # Continuous loop - process all records
+        while True:
+            try:
+                # Process one record
+                has_more = process_one_record(excel_file, sheet_name)
+                
+                if not has_more:
+                    # All records processed
+                    processed_count = len(load_processed_records())
+                    print("\n" + "="*60)
+                    print("🎉 ALL RECORDS PROCESSED!")
+                    print("="*60)
+                    print(f"✅ Total Processed: {processed_count}/{total_records}")
+                    print(f"📁 Output File: {OUTPUT_CSV}")
+                    print("="*60)
+                    break
+                
+                record_count += 1
+                consecutive_errors = 0  # Reset error counter on success
+                
+                # Show progress
+                processed_count = len(load_processed_records())
+                remaining = total_records - processed_count
+                print(f"\n📈 Progress: {processed_count}/{total_records} records done | {remaining} remaining")
+                
+                # Delay before next record (to avoid rate limits)
+                if delay_between_records > 0:
+                    print(f"⏳ Waiting {delay_between_records} seconds before next record...\n")
+                    time.sleep(delay_between_records)
+                
+            except KeyboardInterrupt:
+                # User pressed Ctrl+C
+                processed_count = len(load_processed_records())
+                print("\n\n" + "="*60)
+                print("⏸️  PROCESSING STOPPED BY USER")
+                print("="*60)
+                print(f"✅ Processed so far: {processed_count}/{total_records}")
+                print(f"📁 Progress saved to: {TRACKING_FILE}")
+                print(f"📁 Output saved to: {OUTPUT_CSV}")
+                print(f"💡 Run again to continue from where you left off")
+                print("="*60)
+                break
+                
+            except Exception as e:
+                consecutive_errors += 1
+                error_msg = str(e)
+                
+                # Check if it's an API key error (will be handled by retry logic)
+                if "API_KEY_ERROR" in error_msg or "All API keys failed" in error_msg:
+                    print(f"\n❌ API Key Error: {error_msg}")
+                    if consecutive_errors >= max_consecutive_errors:
+                        print(f"\n⚠️  Too many consecutive errors. Stopping.")
+                        print(f"💡 Check your API keys in .env file")
+                        break
+                    print(f"⏳ Waiting 5 seconds before retry...")
+                    time.sleep(5)
+                    continue
+                
+                # Other errors
+                print(f"\n⚠️  Error processing record: {error_msg}")
+                if consecutive_errors >= max_consecutive_errors:
+                    print(f"\n⚠️  Too many consecutive errors ({consecutive_errors}). Stopping.")
+                    print(f"💡 Check the error messages above")
+                    break
+                
+                print(f"⏳ Waiting 3 seconds before retry...")
+                time.sleep(3)
+                continue
     
     except Exception as e:
-        print(f"❌ Error: {str(e)}", file=sys.stderr)
+        print(f"\n❌ Fatal Error: {str(e)}", file=sys.stderr)
         import traceback
         traceback.print_exc()
         sys.exit(1)
